@@ -63,11 +63,23 @@ sudo bash init-vps.sh --install-caddy --cdn-ip-file /root/cdn-ip.txt
 curl -fsSL https://raw.githubusercontent.com/telly3e/vps-first-initializer/main/init-vps.sh | sudo bash -s -- --install-caddy --cdn-ip-url https://raw.githubusercontent.com/telly3e/vps-first-initializer/main/cdn-ip.txt
 ```
 
+如果不安装 Caddy，可以直接运行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/telly3e/vps-first-initializer/main/init-vps.sh | sudo bash
+```
+
 如果不想在命令里写两遍 raw 地址，也可以用 `VPS_INIT_BASE_URL`：
 
 ```bash
 export VPS_INIT_BASE_URL="https://raw.githubusercontent.com/telly3e/vps-first-initializer/main"
 curl -fsSL "$VPS_INIT_BASE_URL/init-vps.sh" | sudo env VPS_INIT_BASE_URL="$VPS_INIT_BASE_URL" bash -s -- --install-caddy
+```
+
+脚本内置的默认 `VPS_INIT_BASE_URL` 已经指向本仓库，所以通常也可以简化为：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/telly3e/vps-first-initializer/main/init-vps.sh | sudo bash -s -- --install-caddy
 ```
 
 ## SSH 安全顺序

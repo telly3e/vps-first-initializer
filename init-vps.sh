@@ -13,7 +13,13 @@ set -Eeuo pipefail
 #   - install UFW and SSHGuard by default
 #   - optionally install Caddy with the Cloudflare DNS plugin
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+DEFAULT_VPS_INIT_BASE_URL="https://raw.githubusercontent.com/telly3e/vps-first-initializer/main"
+SCRIPT_PATH="${BASH_SOURCE[0]:-}"
+if [[ -n "$SCRIPT_PATH" && "$SCRIPT_PATH" != "-" ]]; then
+  SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd -P)"
+else
+  SCRIPT_DIR="$(pwd -P)"
+fi
 NEW_USER="nini"
 SSH_PORT="22222"
 GITHUB_USER="telly3e"
@@ -29,7 +35,7 @@ TCP_FORWARDING_MODE="auto"
 TPROXY_MODE="off"
 CDN_IP_FILE=""
 CDN_IP_URL="${VPS_INIT_CDN_IP_URL:-}"
-VPS_INIT_BASE_URL="${VPS_INIT_BASE_URL:-}"
+VPS_INIT_BASE_URL="${VPS_INIT_BASE_URL:-$DEFAULT_VPS_INIT_BASE_URL}"
 
 SYSCTL_FILE="/etc/sysctl.d/99-vps-init-tcp.conf"
 SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
@@ -76,6 +82,7 @@ Options:
 
 Examples:
   bash init-vps.sh
+  curl -fsSL https://raw.githubusercontent.com/telly3e/vps-first-initializer/main/init-vps.sh | bash
   bash init-vps.sh --yes --install-caddy
   bash init-vps.sh --github-user telly3e --ssh-port 22222 --no-caddy
   bash init-vps.sh --install-caddy --cdn-ip-url https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/cdn-ip.txt
