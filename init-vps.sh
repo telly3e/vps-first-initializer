@@ -41,6 +41,10 @@ SYSCTL_FILE="/etc/sysctl.d/99-vps-init-tcp.conf"
 SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
 SSHD_DROPIN_FILE="${SSHD_DROPIN_DIR}/99-vps-init-hardening.conf"
 BACKUP_DIR="/root/vps-init-backups"
+CAN_PROMPT="no"
+if [[ -t 0 ]]; then
+  CAN_PROMPT="yes"
+fi
 
 log() {
   printf '\n[+] %s\n' "$*"
@@ -214,6 +218,10 @@ This script will initialize the VPS with:
 EOF
 
   if [[ "$ASSUME_YES" != "yes" ]]; then
+    if [[ "$CAN_PROMPT" != "yes" ]]; then
+      warn "Non-interactive stdin detected; continuing with default choices. Pass --yes to silence this warning."
+      return 0
+    fi
     read -r -p "Continue? Type YES to proceed: " answer
     [[ "$answer" == "YES" ]] || die "Cancelled."
   fi
@@ -744,6 +752,12 @@ prompt_caddy() {
 
   if [[ "$ASSUME_YES" == "yes" ]]; then
     INSTALL_CADDY="no"
+    return 0
+  fi
+
+  if [[ "$CAN_PROMPT" != "yes" ]]; then
+    INSTALL_CADDY="no"
+    warn "Non-interactive stdin detected; skipping Caddy prompt. Pass --install-caddy to install Caddy."
     return 0
   fi
 

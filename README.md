@@ -69,6 +69,12 @@ curl -fsSL https://raw.githubusercontent.com/telly3e/vps-first-initializer/main/
 curl -fsSL https://raw.githubusercontent.com/telly3e/vps-first-initializer/main/init-vps.sh | sudo bash
 ```
 
+管道执行时没有交互输入，脚本会自动使用默认选择并继续执行；默认不安装 Caddy。需要安装 Caddy 时显式加 `--install-caddy`：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/telly3e/vps-first-initializer/main/init-vps.sh | sudo bash -s -- --install-caddy
+```
+
 如果不想在命令里写两遍 raw 地址，也可以用 `VPS_INIT_BASE_URL`：
 
 ```bash
