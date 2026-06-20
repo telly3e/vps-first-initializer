@@ -9,7 +9,7 @@
 - 公钥来源：`https://github.com/telly3e.keys`
 - sudo：`nini` 可免密码 sudo
 - 时间同步：启用 `systemd-timesyncd`，不存在则安装
-- TCP 调优：内置参考 `telly3e/vps-tcp-autotune` 的自动参数选择
+- TCP 调优：写入固定 Proxy VPS sysctl 配置，启用 BBR、IPv4/IPv6 转发和大缓冲区参数
 - Swap：默认创建 `/swapfile`，大小 `2G`，自动兼容 btrfs
 - UFW：默认安装并启用，入站默认拒绝，出站默认允许
 - SSHGuard：默认安装并启用
