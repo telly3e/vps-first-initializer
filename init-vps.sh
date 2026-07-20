@@ -37,6 +37,11 @@ CDN_IP_FILE=""
 CDN_IP_URL="${VPS_INIT_CDN_IP_URL:-}"
 VPS_INIT_BASE_URL="${VPS_INIT_BASE_URL:-$DEFAULT_VPS_INIT_BASE_URL}"
 
+OS_FAMILY=""
+INIT_SYSTEM=""
+SUDO_GROUP=""
+TIME_SYNC_LABEL=""
+
 SYSCTL_FILE="/etc/sysctl.d/99-proxy-vps.conf"
 LEGACY_SYSCTL_FILE="/etc/sysctl.d/99-vps-init-tcp.conf"
 SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
@@ -58,6 +63,64 @@ warn() {
 die() {
   printf '\n[ERROR] %s\n' "$*" >&2
   exit 1
+}
+
+detect_platform() {
+  local os_id=""
+
+  if [[ -r /etc/os-release ]]; then
+    os_id="$(awk -F= '$1 == "ID" {gsub(/\"/, "", $2); print $2; exit}' /etc/os-release)"
+  fi
+
+  if [[ "$os_id" == "alpine" || -e /etc/alpine-release ]]; then
+    OS_FAMILY="alpine"
+    INIT_SYSTEM="openrc"
+    SUDO_GROUP="wheel"
+    TIME_SYNC_LABEL="chrony/OpenRC"
+  elif [[ "$os_id" == "debian" || "$os_id" == "ubuntu" || -n "$(command -v apt-get 2>/dev/null || true)" ]]; then
+    OS_FAMILY="debian"
+    if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+      INIT_SYSTEM="systemd"
+    else
+      INIT_SYSTEM="sysvinit"
+    fi
+    SUDO_GROUP="sudo"
+    TIME_SYNC_LABEL="systemd-timesyncd"
+  else
+    die "Unsupported operating system. This script supports Alpine, Debian, and Ubuntu."
+  fi
+}
+
+enable_alpine_community_repo() {
+  [[ "$OS_FAMILY" == "alpine" ]] || return 0
+  [[ -f /etc/apk/repositories ]] || die "/etc/apk/repositories not found. Cannot enable Alpine community repository."
+
+  if grep -Eq '/community([[:space:]]|$)' /etc/apk/repositories; then
+    return 0
+  fi
+
+  if command -v setup-apkrepos >/dev/null 2>&1; then
+    setup-apkrepos -c || true
+    if grep -Eq '/community([[:space:]]|$)' /etc/apk/repositories; then
+      return 0
+    fi
+  fi
+
+  local main_repo=""
+  main_repo="$(awk '!/^[[:space:]]*#/ && /\/main([[:space:]]|$)/ {sub(/[[:space:]]+$/, "", $1); sub(/\/main$/, "", $1); print $1; exit}' /etc/apk/repositories)"
+  [[ -n "$main_repo" ]] || die "Alpine community repository is required, but no main repository was found in /etc/apk/repositories."
+
+  backup_file /etc/apk/repositories
+  printf '%s/community\n' "$main_repo" >> /etc/apk/repositories
+}
+
+run_package_update() {
+  if [[ "$OS_FAMILY" == "alpine" ]]; then
+    apk update
+  else
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+  fi
 }
 
 usage() {
@@ -84,6 +147,7 @@ Options:
 Examples:
   bash init-vps.sh
   curl -fsSL https://raw.githubusercontent.com/telly3e/vps-first-initializer/main/init-vps.sh | bash
+  apk add --no-cache bash curl && bash init-vps.sh --yes --no-caddy
   bash init-vps.sh --yes --install-caddy
   bash init-vps.sh --github-user telly3e --ssh-port 22222 --no-caddy
   bash init-vps.sh --install-caddy --cdn-ip-url https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/cdn-ip.txt
@@ -203,7 +267,8 @@ This script will initialize the VPS with:
   Public key source     : ${PUBKEY_URL:-inline key}
   Root SSH login        : disabled
   Password SSH login    : disabled
-  Time sync             : systemd-timesyncd
+  Platform              : ${OS_FAMILY} (${INIT_SYSTEM})
+  Time sync             : ${TIME_SYNC_LABEL}
   TCP tuning            : proxy VPS static sysctl profile
   Swap                  : ${ENABLE_SWAP}, size=${SWAP_SIZE}
   UFW                   : ${ENABLE_UFW}
@@ -231,7 +296,43 @@ run_apt_update() {
 
 install_base_packages() {
   log "Installing base packages"
-  run_apt_update
+
+  if [[ "$OS_FAMILY" == "alpine" ]]; then
+    enable_alpine_community_repo
+
+    run_package_update
+    local packages=(
+      bash
+      ca-certificates
+      chrony
+      chrony-openrc
+      curl
+      e2fsprogs
+      e2fsprogs-extra
+      findmnt
+      iproute2
+      iputils-ping
+      musl-utils
+      openssh-server
+      openssh-server-common-openrc
+      procps-ng
+      sudo
+      util-linux-misc
+    )
+
+    if [[ "$ENABLE_UFW" == "yes" ]]; then
+      packages+=(ip6tables ufw)
+    fi
+
+    if [[ "$ENABLE_SSHGUARD" == "yes" ]]; then
+      packages+=(sshguard sshguard-openrc)
+    fi
+
+    apk add --no-cache "${packages[@]}"
+    return 0
+  fi
+
+  run_package_update
   local packages=(
     ca-certificates
     curl
@@ -266,12 +367,22 @@ ensure_user() {
   log "Creating sudo user: ${NEW_USER}"
 
   if ! getent passwd "$NEW_USER" >/dev/null; then
-    adduser --disabled-password --gecos "" "$NEW_USER"
+    if [[ "$OS_FAMILY" == "alpine" ]]; then
+      adduser -D -s /bin/ash "$NEW_USER"
+    else
+      adduser --disabled-password --gecos "" "$NEW_USER"
+    fi
   fi
 
-  usermod -aG sudo "$NEW_USER"
+  if [[ "$OS_FAMILY" == "alpine" ]]; then
+    adduser "$NEW_USER" "$SUDO_GROUP" >/dev/null 2>&1 || true
+    passwd -u "$NEW_USER" >/dev/null 2>&1 || warn "Could not unlock ${NEW_USER}; Alpine may reject SSH key login for a locked account."
+  else
+    usermod -aG "$SUDO_GROUP" "$NEW_USER"
+  fi
 
   local sudoers_file="/etc/sudoers.d/90-${NEW_USER}-nopasswd"
+  install -d -m 0750 /etc/sudoers.d
   printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$NEW_USER" > "$sudoers_file"
   chmod 0440 "$sudoers_file"
   visudo -cf "$sudoers_file" >/dev/null
@@ -288,9 +399,11 @@ valid_public_keys() {
 install_public_keys() {
   log "Installing SSH public keys for ${NEW_USER}"
 
-  local home
+  local home group
   home="$(getent passwd "$NEW_USER" | cut -d: -f6)"
   [[ -n "$home" && -d "$home" ]] || die "Home directory for ${NEW_USER} not found."
+  group="$(id -gn "$NEW_USER")"
+  [[ -n "$group" ]] || die "Primary group for ${NEW_USER} not found."
 
   local ssh_dir="${home}/.ssh"
   local auth_keys="${ssh_dir}/authorized_keys"
@@ -305,14 +418,14 @@ install_public_keys() {
 
   [[ -s "$tmp_keys" ]] || die "No valid SSH public key found from ${PUBKEY_URL:-inline key}."
 
-  install -d -m 0700 -o "$NEW_USER" -g "$NEW_USER" "$ssh_dir"
+  install -d -m 0700 -o "$NEW_USER" -g "$group" "$ssh_dir"
   touch "$auth_keys"
   chmod 0600 "$auth_keys"
 
   cat "$tmp_keys" >> "$auth_keys"
   awk '!seen[$0]++' "$auth_keys" > "${auth_keys}.tmp"
   mv "${auth_keys}.tmp" "$auth_keys"
-  chown -R "$NEW_USER:$NEW_USER" "$ssh_dir"
+  chown -R "$NEW_USER:$group" "$ssh_dir"
   chmod 0700 "$ssh_dir"
   chmod 0600 "$auth_keys"
   rm -f "$tmp_keys"
@@ -321,9 +434,17 @@ install_public_keys() {
 }
 
 detect_sshd_service() {
-  if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
+  if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    if [[ -x /etc/init.d/sshd ]]; then
+      echo "sshd"
+    elif [[ -x /etc/init.d/ssh ]]; then
+      echo "ssh"
+    else
+      echo ""
+    fi
+  elif command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
     echo "ssh"
-  elif systemctl list-unit-files 2>/dev/null | grep -q '^sshd\.service'; then
+  elif command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^sshd\.service'; then
     echo "sshd"
   else
     echo ""
@@ -344,6 +465,7 @@ comment_managed_sshd_directives() {
     -e 's/^([[:space:]]*)PasswordAuthentication[[:space:]]+/\1# Managed by init-vps: PasswordAuthentication /' \
     -e 's/^([[:space:]]*)KbdInteractiveAuthentication[[:space:]]+/\1# Managed by init-vps: KbdInteractiveAuthentication /' \
     -e 's/^([[:space:]]*)ChallengeResponseAuthentication[[:space:]]+/\1# Managed by init-vps: ChallengeResponseAuthentication /' \
+    -e 's/^([[:space:]]*)UsePAM[[:space:]]+/\1# Managed by init-vps: UsePAM /' \
     -e 's/^([[:space:]]*)PermitRootLogin[[:space:]]+/\1# Managed by init-vps: PermitRootLogin /' \
     -e 's/^([[:space:]]*)PermitEmptyPasswords[[:space:]]+/\1# Managed by init-vps: PermitEmptyPasswords /' \
     "$file"
@@ -368,13 +490,19 @@ comment_existing_sshd_directives() {
 write_sshd_hardening() {
   log "Writing SSH hardening config"
 
+  local use_pam_line
+  if [[ "$OS_FAMILY" == "alpine" ]]; then
+    use_pam_line="# PAM is intentionally disabled; Alpine's default OpenSSH server has no PAM support"
+  else
+    use_pam_line="UsePAM yes"
+  fi
+
   install -d -m 0755 "$SSHD_DROPIN_DIR"
   backup_file "$SSHD_DROPIN_FILE"
 
   cat > "$SSHD_DROPIN_FILE" <<EOF
 # Generated by init-vps.sh
 Port ${SSH_PORT}
-Protocol 2
 
 PubkeyAuthentication yes
 PasswordAuthentication no
@@ -383,7 +511,7 @@ ChallengeResponseAuthentication no
 PermitRootLogin no
 PermitEmptyPasswords no
 
-UsePAM yes
+${use_pam_line}
 X11Forwarding no
 MaxAuthTries 3
 ClientAliveInterval 300
@@ -410,9 +538,14 @@ restart_sshd() {
   log "Testing and restarting SSH"
   sshd -t
 
-  local service
+  local service=""
   service="$(detect_sshd_service)"
-  if [[ -n "$service" ]]; then
+
+  if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    [[ -n "$service" ]] || die "Could not find an OpenRC SSH service script."
+    rc-update add "$service" default >/dev/null 2>&1 || true
+    rc-service "$service" restart || rc-service "$service" start || die "Could not restart SSH service: ${service}."
+  elif [[ "$INIT_SYSTEM" == "systemd" && -n "$service" ]]; then
     systemctl restart "$service"
   else
     service ssh restart 2>/dev/null || service sshd restart 2>/dev/null || die "Could not restart SSH service."
@@ -434,14 +567,27 @@ harden_ssh() {
 enable_time_sync() {
   log "Configuring time sync"
 
-  if ! systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd\.service'; then
-    run_apt_update
-    apt-get install -y systemd-timesyncd
+  if [[ "$OS_FAMILY" == "alpine" ]]; then
+    rc-update add chronyd default >/dev/null 2>&1 || true
+    rc-service chronyd restart || rc-service chronyd start || warn "Could not start chronyd automatically."
+    chronyc tracking 2>/dev/null || true
+    return 0
   fi
 
-  systemctl enable --now systemd-timesyncd || true
-  timedatectl set-ntp true || true
-  timedatectl status || true
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    if ! systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd\.service'; then
+      run_package_update
+      apt-get install -y systemd-timesyncd
+    fi
+
+    systemctl enable --now systemd-timesyncd || true
+    timedatectl set-ntp true || true
+    timedatectl status || true
+  else
+    run_package_update
+    apt-get install -y chrony
+    service chrony restart 2>/dev/null || service chrony start 2>/dev/null || warn "Could not start chrony automatically."
+  fi
 }
 
 swap_size_to_mb() {
@@ -473,9 +619,9 @@ configure_swap() {
   if [[ "$fs_type" == "btrfs" ]]; then
     truncate -s 0 /swapfile
     chattr +C /swapfile || warn "Could not set chattr +C on /swapfile; btrfs swap may fail."
-    dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb" status=progress
+    dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb"
   else
-    fallocate -l "$SWAP_SIZE" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb" status=progress
+    fallocate -l "$SWAP_SIZE" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb"
   fi
 
   chmod 0600 /swapfile
@@ -715,7 +861,12 @@ net.ipv4.tcp_mtu_probing = 1
 vm.swappiness = 10
 EOF
 
-  if ! sysctl --system; then
+  if [[ "$OS_FAMILY" == "alpine" ]]; then
+    if ! sysctl -p "$SYSCTL_FILE"; then
+      warn "sysctl -p failed. Some VPS kernels/providers may reject specific values. Config was written to ${SYSCTL_FILE}."
+    fi
+    rc-update add sysctl boot >/dev/null 2>&1 || warn "Could not add the sysctl service to the Alpine boot runlevel."
+  elif ! sysctl --system; then
     warn "sysctl --system failed. Some VPS kernels/providers may reject specific values. Config was written to ${SYSCTL_FILE}."
   fi
 
@@ -758,6 +909,21 @@ prompt_caddy() {
 install_caddy_cloudflare() {
   [[ "$INSTALL_CADDY" == "yes" ]] || return 0
   log "Installing Caddy with Cloudflare DNS plugin"
+
+  if [[ "$OS_FAMILY" == "alpine" ]]; then
+    enable_alpine_community_repo
+    run_package_update
+    apk add --no-cache caddy caddy-openrc
+
+    if ! caddy help add-package >/dev/null 2>&1; then
+      die "The Alpine Caddy package does not support 'caddy add-package'. Use a newer Alpine release or install a custom Caddy build with the Cloudflare module."
+    fi
+
+    caddy add-package github.com/caddy-dns/cloudflare
+    rc-update add caddy default >/dev/null 2>&1 || true
+    rc-service caddy restart || rc-service caddy start || die "Could not start Caddy through OpenRC."
+    return 0
+  fi
 
   export DEBIAN_FRONTEND=noninteractive
   apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg
@@ -859,6 +1025,9 @@ configure_ufw() {
   apply_caddy_cdn_ufw_rules
 
   ufw --force enable
+  if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    rc-update add ufw default >/dev/null 2>&1 || true
+  fi
   ufw status verbose || true
 }
 
@@ -868,7 +1037,14 @@ enable_sshguard() {
 
   command -v sshguard >/dev/null 2>&1 || die "sshguard command not found after installation."
 
-  if systemctl list-unit-files 2>/dev/null | grep -q '^sshguard\.service'; then
+  if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    if [[ -x /etc/init.d/sshguard ]]; then
+      rc-update add sshguard default >/dev/null 2>&1 || true
+      rc-service sshguard restart || rc-service sshguard start || warn "Could not start sshguard automatically."
+    else
+      warn "sshguard is installed but its OpenRC service script was not found."
+    fi
+  elif command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^sshguard\.service'; then
     systemctl enable --now sshguard
     systemctl restart sshguard || true
   else
@@ -888,6 +1064,7 @@ Important:
   3. Only close the root session after the new key login works.
 
 Files changed:
+  Platform      : ${OS_FAMILY} (${INIT_SYSTEM})
   SSH hardening : ${SSHD_DROPIN_FILE}
   TCP tuning    : ${SYSCTL_FILE}
   TCP report    : /root/vps-init-tcp-report.txt
@@ -900,6 +1077,7 @@ EOF
 
 main() {
   need_root
+  detect_platform
   validate_inputs
   prompt_caddy
   confirm_plan
