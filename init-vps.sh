@@ -13,7 +13,7 @@ set -Eeuo pipefail
 #   - install UFW and SSHGuard by default
 #   - optionally install Caddy with the Cloudflare DNS plugin
 
-DEFAULT_VPS_INIT_BASE_URL="https://raw.githubusercontent.com/telly3e/vps-first-initializer/main"
+DEFAULT_DOOKI_EDGE_URL="https://dooki.cloud/edge-nodes.php"
 SCRIPT_PATH="${BASH_SOURCE[0]:-}"
 if [[ -n "$SCRIPT_PATH" && "$SCRIPT_PATH" != "-" ]]; then
   SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd -P)"
@@ -35,10 +35,12 @@ TCP_FORWARDING_MODE="auto"
 TPROXY_MODE="off"
 CDN_IP_FILE=""
 CDN_IP_URL="${VPS_INIT_CDN_IP_URL:-}"
+CDN_IP_SOURCE_MODE="auto"
+[[ -n "$CDN_IP_URL" ]] && CDN_IP_SOURCE_MODE="url"
+DOOKI_EDGE_URL="${VPS_INIT_DOOKI_EDGE_URL:-$DEFAULT_DOOKI_EDGE_URL}"
 CLOUDFLARE_IPV4_URL="${VPS_INIT_CLOUDFLARE_IPV4_URL:-https://www.cloudflare.com/ips-v4}"
 CLOUDFLARE_IPV6_URL="${VPS_INIT_CLOUDFLARE_IPV6_URL:-https://www.cloudflare.com/ips-v6}"
 CLOUDFLARE_IP_FILE=""
-VPS_INIT_BASE_URL="${VPS_INIT_BASE_URL:-$DEFAULT_VPS_INIT_BASE_URL}"
 
 OS_FAMILY=""
 INIT_SYSTEM=""
@@ -142,9 +144,8 @@ Options:
   --no-sshguard            Skip SSHGuard installation and service enablement
   --install-caddy          Install Caddy and github.com/caddy-dns/cloudflare
   --no-caddy               Skip Caddy without prompt
-  --cdn-ip-file FILE       Additional CDN IP list for Caddy 80/443, default: ./cdn-ip.txt
-  --cdn-ip-url URL         Download additional CDN IP list when local file is absent
-                           Cloudflare's official IPv4/IPv6 ranges are fetched automatically
+  --cdn-ip-file FILE       Use this CDN IP list instead of the automatic Dooki/Cloudflare sources
+  --cdn-ip-url URL         Download and use this CDN IP list instead of the automatic sources
   --yes                    Non-interactive mode; answers yes to safe prompts
   -h, --help               Show this help
 
@@ -154,7 +155,7 @@ Examples:
   apk add --no-cache bash curl && bash init-vps.sh --yes --no-caddy
   bash init-vps.sh --yes --install-caddy
   bash init-vps.sh --github-user telly3e --ssh-port 22222 --no-caddy
-  bash init-vps.sh --install-caddy --cdn-ip-url https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/cdn-ip.txt
+  bash init-vps.sh --install-caddy --cdn-ip-url https://example.com/my-cdn-ips.txt
 EOF
 }
 
@@ -209,10 +210,14 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --cdn-ip-file)
+      [[ "$CDN_IP_SOURCE_MODE" != "url" ]] || die "Use either --cdn-ip-file or --cdn-ip-url, not both."
+      CDN_IP_SOURCE_MODE="file"
       CDN_IP_FILE="${2:?missing CDN IP file}"
       shift 2
       ;;
     --cdn-ip-url)
+      [[ "$CDN_IP_SOURCE_MODE" != "file" ]] || die "Use either --cdn-ip-file or --cdn-ip-url, not both."
+      CDN_IP_SOURCE_MODE="url"
       CDN_IP_URL="${2:?missing CDN IP URL}"
       shift 2
       ;;
@@ -262,6 +267,19 @@ validate_inputs() {
 }
 
 confirm_plan() {
+  local cdn_source_summary
+  case "$CDN_IP_SOURCE_MODE" in
+    auto)
+      cdn_source_summary="${DOOKI_EDGE_URL} + Cloudflare official IPv4/IPv6 ranges"
+      ;;
+    file)
+      cdn_source_summary="file: ${CDN_IP_FILE}"
+      ;;
+    url)
+      cdn_source_summary="URL: ${CDN_IP_URL}"
+      ;;
+  esac
+
   cat <<EOF
 
 This script will initialize the VPS with:
@@ -278,8 +296,7 @@ This script will initialize the VPS with:
   UFW                   : ${ENABLE_UFW}
   SSHGuard              : ${ENABLE_SSHGUARD}
   Caddy                 : ${INSTALL_CADDY}
-  Caddy CDN IP file     : ${CDN_IP_FILE:-${SCRIPT_DIR}/cdn-ip.txt}
-  Caddy CDN IP URL      : ${CDN_IP_URL:-${VPS_INIT_BASE_URL:+${VPS_INIT_BASE_URL%/}/cdn-ip.txt}}
+  Caddy CDN IP sources  : ${cdn_source_summary}
 
 EOF
 
@@ -942,39 +959,18 @@ install_caddy_cloudflare() {
   systemctl restart caddy
 }
 
-resolve_cdn_ip_file() {
-  if [[ -n "$CDN_IP_FILE" ]]; then
-    [[ -f "$CDN_IP_FILE" ]] && return 0
-    return 1
-  fi
+download_cdn_ip_source() {
+  local url="$1"
+  local target
 
-  if [[ -f "${SCRIPT_DIR}/cdn-ip.txt" ]]; then
-    CDN_IP_FILE="${SCRIPT_DIR}/cdn-ip.txt"
+  target="$(mktemp)"
+  if curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 \
+    "$url" -o "$target" && [[ -s "$target" ]]; then
+    printf '%s\n' "$target"
     return 0
   fi
 
-  if [[ -f "./cdn-ip.txt" ]]; then
-    CDN_IP_FILE="./cdn-ip.txt"
-    return 0
-  fi
-
-  local url=""
-  if [[ -n "$CDN_IP_URL" ]]; then
-    url="$CDN_IP_URL"
-  elif [[ -n "$VPS_INIT_BASE_URL" ]]; then
-    url="${VPS_INIT_BASE_URL%/}/cdn-ip.txt"
-  fi
-
-  if [[ -n "$url" ]]; then
-    CDN_IP_FILE="$(mktemp)"
-    if curl -fsSL "$url" -o "$CDN_IP_FILE"; then
-      return 0
-    fi
-    rm -f "$CDN_IP_FILE"
-    CDN_IP_FILE=""
-    return 1
-  fi
-
+  rm -f "$target"
   return 1
 }
 
@@ -1035,22 +1031,52 @@ fetch_cloudflare_ip_ranges() {
 apply_caddy_cdn_ufw_rules() {
   [[ "$INSTALL_CADDY" == "yes" ]] || return 0
 
-  if ! resolve_cdn_ip_file; then
-    if [[ -n "$CDN_IP_FILE" ]]; then
-      warn "Configured CDN IP list was not found: ${CDN_IP_FILE}. Ignoring it."
-      CDN_IP_FILE=""
-    fi
-  fi
+  local source_file rules_file source_summary
+  local raw source count=0
+  local -a source_files=()
+  local -a temp_files=()
 
-  if ! fetch_cloudflare_ip_ranges; then
-    warn "Could not download Cloudflare's official IP ranges; continuing with the custom/static CDN list only."
-  fi
+  case "$CDN_IP_SOURCE_MODE" in
+    file)
+      if [[ ! -f "$CDN_IP_FILE" ]]; then
+        warn "Configured CDN IP list was not found: ${CDN_IP_FILE}. UFW will not open 80/443."
+        return 0
+      fi
+      source_files+=("$CDN_IP_FILE")
+      source_summary="file: ${CDN_IP_FILE}"
+      ;;
+    url)
+      if ! source_file="$(download_cdn_ip_source "$CDN_IP_URL")"; then
+        warn "Could not download the configured CDN IP list: ${CDN_IP_URL}. UFW will not open 80/443."
+        return 0
+      fi
+      source_files+=("$source_file")
+      temp_files+=("$source_file")
+      source_summary="URL: ${CDN_IP_URL}"
+      ;;
+    auto)
+      if source_file="$(download_cdn_ip_source "$DOOKI_EDGE_URL")"; then
+        source_files+=("$source_file")
+        temp_files+=("$source_file")
+      else
+        warn "Could not download Dooki edge node list: ${DOOKI_EDGE_URL}."
+      fi
 
-  local rules_file
+      if fetch_cloudflare_ip_ranges; then
+        source_files+=("$CLOUDFLARE_IP_FILE")
+        temp_files+=("$CLOUDFLARE_IP_FILE")
+      else
+        warn "Could not download Cloudflare's official IP ranges."
+      fi
+      source_summary="${DOOKI_EDGE_URL} + Cloudflare official IPv4/IPv6 ranges"
+      ;;
+  esac
+
   rules_file="$(mktemp)"
   {
-    [[ -z "$CLOUDFLARE_IP_FILE" ]] || cat "$CLOUDFLARE_IP_FILE"
-    [[ -z "$CDN_IP_FILE" ]] || cat "$CDN_IP_FILE"
+    for source_file in "${source_files[@]}"; do
+      cat "$source_file"
+    done
   } | awk '
     {
       sub(/\r$/, "", $0)
@@ -1061,17 +1087,17 @@ apply_caddy_cdn_ufw_rules() {
 
   if [[ ! -s "$rules_file" ]]; then
     warn "Caddy is installed, but no CDN IP ranges were available. UFW will not open 80/443."
-    warn "Provide cdn-ip.txt beside init-vps.sh, pass --cdn-ip-file FILE, or pass --cdn-ip-url URL."
+    warn "Provide --cdn-ip-file FILE or --cdn-ip-url URL, or retry the automatic Dooki/Cloudflare sources."
     rm -f "$rules_file"
-    [[ -z "$CLOUDFLARE_IP_FILE" ]] || rm -f "$CLOUDFLARE_IP_FILE"
-    CLOUDFLARE_IP_FILE=""
+    for source_file in "${temp_files[@]}"; do
+      rm -f "$source_file"
+    done
     return 0
   fi
 
-  log "Applying Caddy CDN UFW rules from official Cloudflare ranges and ${CDN_IP_FILE:-custom list: none}"
-
-  local raw source count=0
+  log "Applying Caddy CDN UFW rules from ${source_summary}"
   while IFS= read -r raw || [[ -n "$raw" ]]; do
+    raw="${raw%$'\r'}"
     raw="${raw%%#*}"
     read -r source _ <<< "$raw"
     [[ -n "${source:-}" ]] || continue
@@ -1091,8 +1117,9 @@ apply_caddy_cdn_ufw_rules() {
 
   [[ "$count" -gt 0 ]] || warn "No valid CDN source entries found in the merged CDN list."
   rm -f "$rules_file"
-  [[ -z "$CLOUDFLARE_IP_FILE" ]] || rm -f "$CLOUDFLARE_IP_FILE"
-  CLOUDFLARE_IP_FILE=""
+  for source_file in "${temp_files[@]}"; do
+    rm -f "$source_file"
+  done
 }
 
 configure_ufw() {
