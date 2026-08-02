@@ -14,7 +14,7 @@
 - UFW：默认安装并启用，入站默认拒绝，出站默认允许；Alpine 从 `community` 仓库安装
 - SSHGuard：默认安装并启用；Alpine 使用 OpenRC 服务
 - Caddy：可选安装，并注入 `github.com/caddy-dns/cloudflare`；Alpine 使用 `caddy-openrc`
-- Caddy 端口规则：如果安装 Caddy，脚本会读取同目录 `cdn-ip.txt`，按里面的 IP/CIDR 列表开放 `80/tcp` 和 `443/tcp`
+- Caddy 端口规则：如果安装 Caddy，脚本会自动获取 Cloudflare 官方 IPv4/IPv6 网段，并与同目录 `cdn-ip.txt` 中的自定义 CDN IP/CIDR 合并后开放 `80/tcp` 和 `443/tcp`
 
 ## Alpine
 
@@ -142,11 +142,20 @@ rc-service caddy restart
 
 `caddy add-package` 会替换 Caddy 二进制以加入插件；这是 Caddy 的实验性升级路径，后续 `apk upgrade` 后如果插件消失，需要重新执行插件安装。
 
-随后脚本会配置 UFW。`22222/tcp` 会始终放行；如果安装了 Caddy，则不会直接对全网开放 `80/443`，而是读取 `cdn-ip.txt` 里的纯 IP/CIDR 列表，例如只允许 Cloudflare 和你列出的 CDN 源 IP 访问 `80/tcp`、`443/tcp`。
+随后脚本会配置 UFW。`22222/tcp` 会始终放行；如果安装了 Caddy，则不会直接对全网开放 `80/443`，而是将 Cloudflare 官方 IP 网段与 `cdn-ip.txt` 里的纯 IP/CIDR 列表合并去重，只允许这些 CDN 源访问 `80/tcp`、`443/tcp`。
 
-如果 VPS 上没有 `cdn-ip.txt`，脚本会保守处理：不开放 `80/443`，并提示你把文件放到 `init-vps.sh` 同目录，或者用 `--cdn-ip-file` / `--cdn-ip-url` 指定。
+Cloudflare 的 CDN 使用 Anycast，官方不会提供每个边缘节点的固定 IP 清单；用于源站防火墙白名单的是官方公布的 CIDR 网段。脚本安装时从以下官方接口获取最新列表：
 
-`cdn-ip.txt` 是纯数据文件，不再是 shell 脚本。格式是每行一个 IP 或 CIDR，支持空行和 `#` 注释：
+```text
+https://www.cloudflare.com/ips-v4
+https://www.cloudflare.com/ips-v6
+```
+
+如果网络暂时无法访问 Cloudflare，脚本会继续使用 `cdn-ip.txt` 或 `--cdn-ip-file` / `--cdn-ip-url` 提供的静态列表；如果完全没有任何列表，则保守地不开放 `80/443`。
+
+如果 VPS 上没有 `cdn-ip.txt`，脚本仍会尝试使用刚刚获取的 Cloudflare 官方网段；如果官方接口和自定义列表都不可用，才会保守地不开放 `80/443`。你也可以把额外 CDN 列表放到 `init-vps.sh` 同目录，或者用 `--cdn-ip-file` / `--cdn-ip-url` 指定。
+
+`cdn-ip.txt` 是纯数据文件，不再是 shell 脚本。它可以放额外 CDN 节点或源站 IP；Cloudflare 网段由脚本自动获取，文件中的 Cloudflare 网段仍可作为离线兜底。格式是每行一个 IP 或 CIDR，支持空行和 `#` 注释：
 
 ```text
 # Cloudflare IPv4

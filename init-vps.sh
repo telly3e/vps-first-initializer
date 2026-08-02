@@ -35,6 +35,9 @@ TCP_FORWARDING_MODE="auto"
 TPROXY_MODE="off"
 CDN_IP_FILE=""
 CDN_IP_URL="${VPS_INIT_CDN_IP_URL:-}"
+CLOUDFLARE_IPV4_URL="${VPS_INIT_CLOUDFLARE_IPV4_URL:-https://www.cloudflare.com/ips-v4}"
+CLOUDFLARE_IPV6_URL="${VPS_INIT_CLOUDFLARE_IPV6_URL:-https://www.cloudflare.com/ips-v6}"
+CLOUDFLARE_IP_FILE=""
 VPS_INIT_BASE_URL="${VPS_INIT_BASE_URL:-$DEFAULT_VPS_INIT_BASE_URL}"
 
 OS_FAMILY=""
@@ -139,8 +142,9 @@ Options:
   --no-sshguard            Skip SSHGuard installation and service enablement
   --install-caddy          Install Caddy and github.com/caddy-dns/cloudflare
   --no-caddy               Skip Caddy without prompt
-  --cdn-ip-file FILE       CDN IP list file for Caddy 80/443, default: ./cdn-ip.txt
-  --cdn-ip-url URL         Download CDN IP list from URL when local file is absent
+  --cdn-ip-file FILE       Additional CDN IP list for Caddy 80/443, default: ./cdn-ip.txt
+  --cdn-ip-url URL         Download additional CDN IP list when local file is absent
+                           Cloudflare's official IPv4/IPv6 ranges are fetched automatically
   --yes                    Non-interactive mode; answers yes to safe prompts
   -h, --help               Show this help
 
@@ -979,16 +983,92 @@ valid_cdn_source() {
   [[ "$source" =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ ]]
 }
 
+validate_cdn_ip_file() {
+  local file="$1"
+  local raw source count=0
+
+  [[ -s "$file" ]] || return 1
+
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    raw="${raw%$'\r'}"
+    raw="${raw%%#*}"
+    read -r source _ <<< "$raw"
+    [[ -n "${source:-}" ]] || continue
+
+    valid_cdn_source "$source" || return 1
+    count=$((count + 1))
+  done < "$file"
+
+  [[ "$count" -gt 0 ]]
+}
+
+fetch_cloudflare_ip_ranges() {
+  local ipv4_file ipv6_file
+
+  ipv4_file="$(mktemp)"
+  ipv6_file="$(mktemp)"
+
+  if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 \
+    "$CLOUDFLARE_IPV4_URL" -o "$ipv4_file" || \
+    ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 \
+    "$CLOUDFLARE_IPV6_URL" -o "$ipv6_file"; then
+    rm -f "$ipv4_file" "$ipv6_file"
+    return 1
+  fi
+
+  if ! validate_cdn_ip_file "$ipv4_file" || ! validate_cdn_ip_file "$ipv6_file"; then
+    rm -f "$ipv4_file" "$ipv6_file"
+    return 1
+  fi
+
+  CLOUDFLARE_IP_FILE="$(mktemp)"
+  {
+    printf '%s\n' '# Cloudflare IPv4 (official)' '# Source: https://www.cloudflare.com/ips-v4'
+    cat "$ipv4_file"
+    printf '%s\n' '' '# Cloudflare IPv6 (official)' '# Source: https://www.cloudflare.com/ips-v6'
+    cat "$ipv6_file"
+  } > "$CLOUDFLARE_IP_FILE"
+
+  rm -f "$ipv4_file" "$ipv6_file"
+}
+
 apply_caddy_cdn_ufw_rules() {
   [[ "$INSTALL_CADDY" == "yes" ]] || return 0
 
   if ! resolve_cdn_ip_file; then
-    warn "Caddy is installed, but cdn-ip.txt was not found. UFW will not open 80/443."
-    warn "Upload cdn-ip.txt beside init-vps.sh, pass --cdn-ip-file FILE, or pass --cdn-ip-url URL."
+    if [[ -n "$CDN_IP_FILE" ]]; then
+      warn "Configured CDN IP list was not found: ${CDN_IP_FILE}. Ignoring it."
+      CDN_IP_FILE=""
+    fi
+  fi
+
+  if ! fetch_cloudflare_ip_ranges; then
+    warn "Could not download Cloudflare's official IP ranges; continuing with the custom/static CDN list only."
+  fi
+
+  local rules_file
+  rules_file="$(mktemp)"
+  {
+    [[ -z "$CLOUDFLARE_IP_FILE" ]] || cat "$CLOUDFLARE_IP_FILE"
+    [[ -z "$CDN_IP_FILE" ]] || cat "$CDN_IP_FILE"
+  } | awk '
+    {
+      sub(/\r$/, "", $0)
+      if ($1 == "" || $1 ~ /^#/) next
+      if (!seen[$1]++) print $1
+    }
+  ' > "$rules_file"
+
+  if [[ ! -s "$rules_file" ]]; then
+    warn "Caddy is installed, but no CDN IP ranges were available. UFW will not open 80/443."
+    warn "Provide cdn-ip.txt beside init-vps.sh, pass --cdn-ip-file FILE, or pass --cdn-ip-url URL."
+    rm -f "$rules_file"
+    [[ -z "$CLOUDFLARE_IP_FILE" ]] || rm -f "$CLOUDFLARE_IP_FILE"
+    CLOUDFLARE_IP_FILE=""
     return 0
   fi
 
-  log "Applying Caddy CDN UFW rules from ${CDN_IP_FILE}"
+  log "Applying Caddy CDN UFW rules from official Cloudflare ranges and ${CDN_IP_FILE:-custom list: none}"
 
   local raw source count=0
   while IFS= read -r raw || [[ -n "$raw" ]]; do
@@ -1007,9 +1087,12 @@ apply_caddy_cdn_ufw_rules() {
     else
       warn "Failed to apply UFW rules for CDN source: ${source}"
     fi
-  done < "$CDN_IP_FILE"
+  done < "$rules_file"
 
-  [[ "$count" -gt 0 ]] || warn "No valid CDN source entries found in ${CDN_IP_FILE}."
+  [[ "$count" -gt 0 ]] || warn "No valid CDN source entries found in the merged CDN list."
+  rm -f "$rules_file"
+  [[ -z "$CLOUDFLARE_IP_FILE" ]] || rm -f "$CLOUDFLARE_IP_FILE"
+  CLOUDFLARE_IP_FILE=""
 }
 
 configure_ufw() {
