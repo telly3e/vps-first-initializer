@@ -16,6 +16,14 @@
 - Caddy：可选安装，并注入 `github.com/caddy-dns/cloudflare`；Alpine 使用 `caddy-openrc`
 - Caddy 端口规则：如果未指定 CDN 列表，脚本会自动合并 Dooki 节点页和 Cloudflare 官方 IPv4/IPv6 网段；如果指定 `--cdn-ip-file` 或 `--cdn-ip-url`，则使用指定列表开放 `80/tcp` 和 `443/tcp`
 
+所有远程 CDN 地址源都通过 `curl --http2` 获取。如果 curl 不支持 HTTP/2、请求失败或返回空内容，脚本会在终端提示，并跳过该来源，不会把它的 IP 加入 UFW 白名单；不会自动降级到 HTTP/1.1。可用下面的命令检查 curl 是否包含 HTTP/2：
+
+```sh
+curl --version
+```
+
+输出的 `Features` 行应包含 `HTTP2`。
+
 ## Alpine
 
 Alpine 最小系统通常没有 Bash。先以 `root` 安装 Bash 和 curl，再执行脚本：

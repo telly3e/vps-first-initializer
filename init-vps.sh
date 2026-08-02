@@ -964,7 +964,7 @@ download_cdn_ip_source() {
   local target
 
   target="$(mktemp)"
-  if curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 \
+  if curl --http2 -fsSL --retry 3 --connect-timeout 10 --max-time 30 \
     "$url" -o "$target" && [[ -s "$target" ]]; then
     printf '%s\n' "$target"
     return 0
@@ -1004,9 +1004,9 @@ fetch_cloudflare_ip_ranges() {
   ipv4_file="$(mktemp)"
   ipv6_file="$(mktemp)"
 
-  if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 \
+  if ! curl --http2 -fsSL --retry 3 --connect-timeout 10 --max-time 30 \
     "$CLOUDFLARE_IPV4_URL" -o "$ipv4_file" || \
-    ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 \
+    ! curl --http2 -fsSL --retry 3 --connect-timeout 10 --max-time 30 \
     "$CLOUDFLARE_IPV6_URL" -o "$ipv6_file"; then
     rm -f "$ipv4_file" "$ipv6_file"
     return 1
@@ -1047,7 +1047,7 @@ apply_caddy_cdn_ufw_rules() {
       ;;
     url)
       if ! source_file="$(download_cdn_ip_source "$CDN_IP_URL")"; then
-        warn "Could not download the configured CDN IP list: ${CDN_IP_URL}. UFW will not open 80/443."
+        warn "Could not download the configured CDN IP list with HTTP/2 (unsupported, request failed, or empty response): ${CDN_IP_URL}. Its IPs will not be added; UFW will not open 80/443."
         return 0
       fi
       source_files+=("$source_file")
@@ -1059,14 +1059,14 @@ apply_caddy_cdn_ufw_rules() {
         source_files+=("$source_file")
         temp_files+=("$source_file")
       else
-        warn "Could not download Dooki edge node list: ${DOOKI_EDGE_URL}."
+        warn "Could not download Dooki edge node list with HTTP/2 (unsupported, request failed, or empty response): ${DOOKI_EDGE_URL}. Its IPs will not be added."
       fi
 
       if fetch_cloudflare_ip_ranges; then
         source_files+=("$CLOUDFLARE_IP_FILE")
         temp_files+=("$CLOUDFLARE_IP_FILE")
       else
-        warn "Could not download Cloudflare's official IP ranges."
+        warn "Could not download Cloudflare's official IP ranges with HTTP/2 (unsupported, request failed, or empty response). Those IP ranges will not be added."
       fi
       source_summary="${DOOKI_EDGE_URL} + Cloudflare official IPv4/IPv6 ranges"
       ;;
