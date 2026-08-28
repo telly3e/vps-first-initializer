@@ -1,168 +1,60 @@
 # VPS First Initializer
 
-这是一个面向 Debian/Ubuntu/Alpine VPS 首次登录的初始化脚本。默认你用 `root` 登录执行，脚本会创建 `nini` 用户、拉取 GitHub 公钥、把 SSH 改到 `22222`，然后禁用 root 登录和密码登录。
+适用于 Debian、Ubuntu、Alpine VPS 的首次初始化。请以 `root` 执行。脚本默认创建 `nini` 用户、写入 GitHub 公钥、将 SSH 改到 `22222`，并关闭 root 和密码 SSH 登录；同时默认启用 Swap、UFW、SSHGuard。
 
-默认配置：
+## 一键执行
 
-- 用户：`nini`
-- SSH 端口：`22222`
-- 公钥来源：`https://github.com/telly3e.keys`
-- sudo：`nini` 可免密码 sudo
-- 时间同步：Debian/Ubuntu 使用 `systemd-timesyncd`；Alpine 使用 `chrony` 和 OpenRC
-- TCP 调优：写入固定 Proxy VPS sysctl 配置，启用 BBR、IPv4/IPv6 转发和大缓冲区参数
-- Swap：默认创建 `/swapfile`，大小 `2G`，自动兼容 btrfs
-- UFW：默认安装并启用，入站默认拒绝，出站默认允许；Alpine 从 `community` 仓库安装
-- SSHGuard：默认安装并启用；Alpine 使用 OpenRC 服务
-- Caddy：可选安装，并注入 `github.com/caddy-dns/cloudflare`；Alpine 使用 `caddy-openrc`
-- Caddy 端口规则：如果未指定 CDN 列表，脚本会自动合并 Dooki 节点页和 Cloudflare 官方 IPv4/IPv6 网段；如果指定 `--cdn-ip-file` 或 `--cdn-ip-url`，则使用指定列表开放 `80/tcp` 和 `443/tcp`
-
-所有远程 CDN 地址源都通过 `curl --http2` 获取。如果 curl 不支持 HTTP/2、请求失败或返回空内容，脚本会在终端提示，并跳过该来源，不会把它的 IP 加入 UFW 白名单；不会自动降级到 HTTP/1.1。可用下面的命令检查 curl 是否包含 HTTP/2：
+Debian/Ubuntu（默认不安装 Caddy）：
 
 ```sh
-curl --version
-```
-
-输出的 `Features` 行应包含 `HTTP2`。
-
-## Alpine
-
-Alpine 最小系统通常没有 Bash。先以 `root` 安装 Bash 和 curl，再执行脚本：
-
-```sh
-apk add --no-cache bash curl
 curl -fsSL https://raw.githubusercontent.com/telly3e/vps-first-initializer/main/init-vps.sh | bash -s -- --yes --no-caddy
 ```
 
-如果要安装 Caddy：
+需要安装 Caddy：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/telly3e/vps-first-initializer/main/init-vps.sh | bash -s -- --yes --install-caddy
 ```
 
-Alpine 路径会自动使用 `apk`、OpenRC、`chronyd`、`wheel` 和 `sysctl -p`。脚本需要 Alpine 的 `community` 仓库来安装 `sudo`，如果没有该仓库会尝试自动启用它；UFW 和 Caddy 也来自这个仓库。脚本仍然使用 `sudo` 作为管理员工具；Alpine 官方更推荐 `doas`，但这里保留原脚本的无密码 sudo 行为。
+Alpine：
 
-如果是 diskless/data 模式，用户目录、SSH 配置、UFW 和其他修改还需要按你的存储布局用 `lbu` 持久化；普通磁盘安装则按 `/etc/fstab` 和系统磁盘的持久性处理。
-
-脚本依然要求在真实 VPS/完整 Alpine 系统上运行。不要直接在没有 SSH 服务、启动系统或内核权限的普通 Docker 容器里执行。
-
-## 推荐执行
-
-先在本地检查脚本内容，再传到 VPS 执行：
-
-```bash
-sudo bash init-vps.sh
+```sh
+apk add --no-cache bash curl && curl -fsSL https://raw.githubusercontent.com/telly3e/vps-first-initializer/main/init-vps.sh | bash -s -- --yes --no-caddy
 ```
 
-非交互执行，并安装 Caddy：
+执行完成后保留当前 SSH 会话，另开终端测试新连接：
 
-```bash
-sudo bash init-vps.sh --yes --install-caddy
-```
-
-不安装 Caddy：
-
-```bash
-sudo bash init-vps.sh --yes --no-caddy
-```
-
-跳过 UFW 或 SSHGuard：
-
-```bash
-sudo bash init-vps.sh --yes --no-ufw
-sudo bash init-vps.sh --yes --no-sshguard
-```
-
-指定公钥来源：
-
-```bash
-sudo bash init-vps.sh --github-user telly3e
-sudo bash init-vps.sh --pubkey-url https://github.com/telly3e.keys
-sudo bash init-vps.sh --pubkey 'ssh-ed25519 AAAA...'
-```
-
-默认安装 Caddy 时，脚本会自动获取 Dooki 和 Cloudflare 的 CDN IP 列表：
-
-```bash
-sudo bash init-vps.sh --yes --install-caddy
-```
-
-如果要完全使用自己的本地 CDN IP/CIDR 文件：
-
-```bash
-sudo bash init-vps.sh --install-caddy --cdn-ip-file /root/cdn-ip.txt
-```
-
-也可以完全使用自己的远程 CDN IP/CIDR 列表：
-
-```bash
-sudo bash init-vps.sh --install-caddy --cdn-ip-url https://example.com/my-cdn-ips.txt
-```
-
-如果不安装 Caddy，可以直接运行：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/telly3e/vps-first-initializer/main/init-vps.sh | sudo bash
-```
-
-管道执行时没有交互输入，脚本会自动使用默认选择并继续执行；默认不安装 Caddy。需要安装 Caddy 时显式加 `--install-caddy`：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/telly3e/vps-first-initializer/main/init-vps.sh | sudo bash -s -- --install-caddy
-```
-
-## SSH 安全顺序
-
-脚本会先创建用户并写入 `authorized_keys`，确认 key 不为空后才会修改 SSH 配置。修改后会执行 `sshd -t`，通过后才重启 SSH 服务。
-
-执行完成后不要立刻关闭当前 root 会话。先开第二个终端测试：
-
-```bash
+```sh
 ssh -p 22222 nini@YOUR_SERVER_IP
 ```
 
-确认新连接可用后，再关闭旧的 root 会话。
+## 参数
 
-## Caddy Cloudflare DNS 插件
-
-在 Debian/Ubuntu 上选择安装 Caddy 时，脚本会：
-
-```bash
-apt install caddy
-caddy add-package github.com/caddy-dns/cloudflare
-systemctl restart caddy
-```
-
-在 Alpine 上，脚本会从 `community` 仓库安装 `caddy` 和 `caddy-openrc`，然后执行：
+参数放在命令最后，例如：
 
 ```sh
-apk add caddy caddy-openrc
-caddy add-package github.com/caddy-dns/cloudflare
-rc-update add caddy
-rc-service caddy restart
+curl -fsSL https://raw.githubusercontent.com/telly3e/vps-first-initializer/main/init-vps.sh | bash -s -- --yes --no-caddy --user alice --ssh-port 22022 --github-user YOUR_GITHUB_USER
 ```
 
-`caddy add-package` 会替换 Caddy 二进制以加入插件；这是 Caddy 的实验性升级路径，后续 `apk upgrade` 后如果插件消失，需要重新执行插件安装。
+常用参数：
 
-随后脚本会配置 UFW。`22222/tcp` 会始终放行；如果安装了 Caddy，则不会直接对全网开放 `80/443`。
+| 参数 | 示例 | 说明 |
+| --- | --- | --- |
+| `--user USER` | `--user alice` | 创建的 Linux 用户，默认 `nini` |
+| `--ssh-port PORT` | `--ssh-port 22022` | SSH 新端口，范围 `1-65535` |
+| `--github-user USER` | `--github-user telly3e` | 从 `https://github.com/USER.keys` 获取公钥 |
+| `--pubkey-url URL` | `--pubkey-url https://example.com/keys` | 从自定义地址获取公钥 |
+| `--pubkey 'KEY'` | `--pubkey 'ssh-ed25519 AAAA...'` | 直接填写完整 SSH 公钥，可重复填写 |
+| `--swap-size SIZE` | `--swap-size 4G` | Swap 大小，默认 `2G` |
+| `--no-swap` |  | 不创建 Swap |
+| `--no-ufw` |  | 不安装或配置 UFW |
+| `--no-sshguard` |  | 不安装或启用 SSHGuard |
+| `--install-caddy` |  | 安装 Caddy 和 Cloudflare DNS 插件 |
+| `--no-caddy` |  | 不安装 Caddy |
+| `--cdn-ip-file FILE` | `--cdn-ip-file /root/cdn-ip.txt` | Caddy 使用本地 CDN IP/CIDR 列表 |
+| `--cdn-ip-url URL` | `--cdn-ip-url https://example.com/cdn-ips.txt` | Caddy 下载远程 CDN IP/CIDR 列表 |
+| `--yes` |  | 非交互执行 |
 
-未指定 `--cdn-ip-file` 或 `--cdn-ip-url` 时，脚本会获取并合并以下来源：
+`--pubkey-url`、`--pubkey` 和 `--github-user` 选择一种公钥来源即可。`--cdn-ip-file` 和 `--cdn-ip-url` 也只能二选一；列表按每行一个 IP 或 CIDR 填写，使用 Caddy 时才需要设置。
 
-- Dooki：`https://dooki.cloud/edge-nodes.php`
-- Cloudflare 官方 IPv4：`https://www.cloudflare.com/ips-v4`
-- Cloudflare 官方 IPv6：`https://www.cloudflare.com/ips-v6`
-
-Cloudflare 的 CDN 使用 Anycast，官方不会提供每个边缘节点的固定 IP 清单；用于源站防火墙白名单的是官方公布的 CIDR 网段。
-
-如果指定 `--cdn-ip-file` 或 `--cdn-ip-url`，脚本会使用指定列表，不再获取默认的 Dooki/Cloudflare 来源。列表会自动去重，并逐条校验 IP/CIDR 格式。
-
-如果自动来源或指定列表为空、下载失败或没有有效 IP，脚本会保守地不开放 `80/443`。
-
-自定义列表是纯数据文件，格式为每行一个 IP 或 CIDR，支持空行和 `#` 注释：
-
-```text
-# CDN IPv4 or IPv6
-203.0.113.0/24
-
-# CDN origin IPv4
-160.16.141.30
-```
+如果使用 `--install-caddy` 但不指定 CDN 列表，脚本会自动获取 Dooki 和 Cloudflare 官方网段。
