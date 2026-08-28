@@ -9,7 +9,7 @@ set -Eeuo pipefail
 #   - move SSH to port 22222
 #   - disable root login and password login
 #   - enable time sync
-#   - configure swap and TCP tuning
+#   - configure swap
 #   - install UFW and SSHGuard by default
 #   - optionally install Caddy with the Cloudflare DNS plugin
 
@@ -31,8 +31,6 @@ ENABLE_UFW="yes"
 ENABLE_SSHGUARD="yes"
 INSTALL_CADDY="ask"
 ASSUME_YES="no"
-TCP_FORWARDING_MODE="auto"
-TPROXY_MODE="off"
 CDN_IP_FILE=""
 CDN_IP_URL="${VPS_INIT_CDN_IP_URL:-}"
 CDN_IP_SOURCE_MODE="auto"
@@ -47,8 +45,6 @@ INIT_SYSTEM=""
 SUDO_GROUP=""
 TIME_SYNC_LABEL=""
 
-SYSCTL_FILE="/etc/sysctl.d/99-proxy-vps.conf"
-LEGACY_SYSCTL_FILE="/etc/sysctl.d/99-vps-init-tcp.conf"
 SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
 SSHD_DROPIN_FILE="${SSHD_DROPIN_DIR}/99-vps-init-hardening.conf"
 BACKUP_DIR="/root/vps-init-backups"
@@ -221,22 +217,6 @@ while [[ $# -gt 0 ]]; do
       CDN_IP_URL="${2:?missing CDN IP URL}"
       shift 2
       ;;
-    --forward)
-      TCP_FORWARDING_MODE="on"
-      shift
-      ;;
-    --no-forward)
-      TCP_FORWARDING_MODE="off"
-      shift
-      ;;
-    --auto-forward)
-      TCP_FORWARDING_MODE="auto"
-      shift
-      ;;
-    --tproxy)
-      TPROXY_MODE="on"
-      shift
-      ;;
     --yes)
       ASSUME_YES="yes"
       shift
@@ -291,7 +271,6 @@ This script will initialize the VPS with:
   Password SSH login    : disabled
   Platform              : ${OS_FAMILY} (${INIT_SYSTEM})
   Time sync             : ${TIME_SYNC_LABEL}
-  TCP tuning            : proxy VPS static sysctl profile
   Swap                  : ${ENABLE_SWAP}, size=${SWAP_SIZE}
   UFW                   : ${ENABLE_UFW}
   SSHGuard              : ${ENABLE_SSHGUARD}
@@ -331,12 +310,9 @@ install_base_packages() {
       e2fsprogs
       e2fsprogs-extra
       findmnt
-      iproute2
-      iputils-ping
       musl-utils
       openssh-server
       openssh-server-common-openrc
-      procps-ng
       sudo
       util-linux-misc
     )
@@ -358,8 +334,6 @@ install_base_packages() {
     ca-certificates
     curl
     gnupg
-    iproute2
-    iputils-ping
     openssh-server
     sudo
     e2fsprogs
@@ -657,251 +631,6 @@ configure_swap() {
   swapon --show || true
 }
 
-command_exists() {
-  command -v "$1" >/dev/null 2>&1
-}
-
-get_mem_mb() {
-  awk '/MemTotal/ {printf "%d\n", $2 / 1024}' /proc/meminfo
-}
-
-get_cpu_count() {
-  nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo "1"
-}
-
-get_virt_type() {
-  if command_exists systemd-detect-virt; then
-    systemd-detect-virt 2>/dev/null || echo "none"
-  elif grep -qa docker /proc/1/cgroup 2>/dev/null; then
-    echo "docker"
-  elif grep -qa lxc /proc/1/cgroup 2>/dev/null; then
-    echo "lxc"
-  elif [[ -d /proc/vz && ! -d /proc/bc ]]; then
-    echo "openvz"
-  else
-    echo "unknown"
-  fi
-}
-
-get_default_iface_v4() {
-  ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}'
-}
-
-get_iface_speed_mbps() {
-  local iface="$1"
-  local speed=""
-
-  if [[ -n "$iface" && -r "/sys/class/net/$iface/speed" ]]; then
-    speed="$(cat "/sys/class/net/$iface/speed" 2>/dev/null || true)"
-    if [[ "$speed" =~ ^[0-9]+$ && "$speed" -gt 0 ]]; then
-      echo "$speed"
-      return
-    fi
-  fi
-
-  echo "0"
-}
-
-has_ipv6_default_route() {
-  ip -6 route show default 2>/dev/null | grep -q '^default' && echo "1" || echo "0"
-}
-
-has_tun_device() {
-  [[ -c /dev/net/tun ]] && echo "1" || echo "0"
-}
-
-detect_proxy_like_processes() {
-  local names="xray|v2ray|sing-box|hysteria|tuic|trojan|naive|brook|wireguard|wg-quick|tailscale|zerotier|openvpn"
-  ps -eo comm,args 2>/dev/null | grep -Eiq "$names" && echo "1" || echo "0"
-}
-
-has_tproxy_rules() {
-  local hit=0
-  command_exists lsmod && lsmod 2>/dev/null | grep -Eq 'xt_TPROXY|nf_tproxy|nft_tproxy' && hit=1
-  command_exists iptables && iptables-save 2>/dev/null | grep -qi 'TPROXY' && hit=1
-  command_exists nft && nft list ruleset 2>/dev/null | grep -qi 'tproxy' && hit=1
-  echo "$hit"
-}
-
-ping_avg_ms() {
-  local target="$1"
-  local output avg
-
-  output="$(ping -c 3 -W 2 "$target" 2>/dev/null)" || return 1
-  avg="$(printf '%s\n' "$output" | awk -F'/' '/rtt|round-trip/ {print $5}')"
-  [[ -n "$avg" ]] || return 1
-  printf '%.0f\n' "$avg"
-}
-
-pick_best_latency() {
-  local targets=("www.189.cn" "baidu.com" "taobao.com" "163.com")
-  local target ms best_ms=""
-
-  for target in "${targets[@]}"; do
-    if ms="$(ping_avg_ms "$target")"; then
-      if [[ -z "$best_ms" || "$ms" -lt "$best_ms" ]]; then
-        best_ms="$ms"
-      fi
-    fi
-  done
-
-  echo "${best_ms:-0}"
-}
-
-choose_buffer_bytes() {
-  local latency_ms="$1"
-  local mem_mb="$2"
-  local speed_mbps="$3"
-  local virt="$4"
-
-  case "$virt" in
-    openvz|docker|lxc|podman|container)
-      [[ "$mem_mb" -lt 1024 ]] && echo "16777216" || echo "33554432"
-      return
-      ;;
-  esac
-
-  if [[ "$mem_mb" -lt 768 ]]; then
-    echo "16777216"
-  elif [[ "$speed_mbps" -gt 0 && "$speed_mbps" -le 100 ]]; then
-    [[ "$latency_ms" -gt 180 && "$mem_mb" -ge 1024 ]] && echo "33554432" || echo "16777216"
-  elif [[ "$latency_ms" -le 0 ]]; then
-    [[ "$mem_mb" -ge 1024 ]] && echo "33554432" || echo "16777216"
-  elif [[ "$latency_ms" -le 80 ]]; then
-    [[ "$mem_mb" -ge 1024 ]] && echo "33554432" || echo "16777216"
-  elif [[ "$latency_ms" -le 180 ]]; then
-    [[ "$mem_mb" -ge 1024 ]] && echo "67108864" || echo "33554432"
-  elif [[ "$mem_mb" -ge 2048 && "$speed_mbps" -ge 1000 ]]; then
-    echo "134217728"
-  else
-    echo "67108864"
-  fi
-}
-
-choose_congestion() {
-  modprobe tcp_bbr 2>/dev/null || true
-  if [[ -r /proc/sys/net/ipv4/tcp_available_congestion_control ]] && grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control; then
-    echo "bbr"
-  else
-    cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo "cubic"
-  fi
-}
-
-choose_forwarding() {
-  local has_tun="$1"
-  local proxy_like="$2"
-  local tproxy_like="$3"
-
-  case "$TCP_FORWARDING_MODE" in
-    on)
-      echo "1"
-      ;;
-    off)
-      echo "0"
-      ;;
-    auto)
-      if [[ "$has_tun" -eq 1 || "$proxy_like" -eq 1 || "$tproxy_like" -eq 1 ]]; then
-        echo "1"
-      else
-        echo "0"
-      fi
-      ;;
-  esac
-}
-
-configure_tcp_tuning() {
-  log "Configuring TCP tuning"
-  if [[ -f "$LEGACY_SYSCTL_FILE" && "$LEGACY_SYSCTL_FILE" != "$SYSCTL_FILE" ]]; then
-    backup_file "$LEGACY_SYSCTL_FILE"
-    rm -f "$LEGACY_SYSCTL_FILE"
-  fi
-
-  backup_file "$SYSCTL_FILE"
-  cat > "$SYSCTL_FILE" <<EOF
-# Generated by init-vps.sh
-# Proxy VPS TCP sysctl tuning
-
-# 1. Basic file descriptor limits for high concurrency.
-fs.file-max = 6815744
-fs.nr_open = 6815744
-
-# 2. Network queue and connection tuning.
-net.core.somaxconn = 65535
-net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.tcp_abort_on_overflow = 1
-net.ipv4.ip_local_port_range = 1024 65535
-net.core.netdev_max_backlog = 65536
-
-# 3. BBR and congestion control.
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 3
-
-# 4. TCP window and buffer tuning for high bandwidth / long-haul links.
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_adv_win_scale = 1
-net.ipv4.tcp_moderate_rcvbuf = 1
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.ipv4.tcp_rmem = 4096 87380 67108864
-net.ipv4.tcp_wmem = 4096 65536 67108864
-net.ipv4.udp_rmem_min = 8192
-net.ipv4.udp_wmem_min = 8192
-
-# 5. IPv6 enablement and forwarding.
-net.ipv6.conf.all.disable_ipv6 = 0
-net.ipv6.conf.default.disable_ipv6 = 0
-net.ipv6.conf.lo.disable_ipv6 = 0
-net.ipv6.conf.all.forwarding = 1
-net.ipv6.conf.default.forwarding = 1
-net.ipv6.route.max_size = 1048576
-net.ipv6.neigh.default.gc_thresh1 = 1024
-net.ipv6.neigh.default.gc_thresh2 = 4096
-net.ipv6.neigh.default.gc_thresh3 = 8192
-
-# 6. Timestamps and connection recycling.
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_slow_start_after_idle = 0
-
-# 7. Security and forwarding.
-net.ipv4.conf.all.rp_filter = 0
-net.ipv4.conf.default.rp_filter = 0
-net.ipv4.ip_forward = 1
-net.ipv4.conf.all.route_localnet = 1
-net.ipv4.tcp_rfc1337 = 1
-net.ipv4.tcp_ecn = 0
-
-# 8. Auxiliary tuning.
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_fack = 1
-net.ipv4.tcp_mtu_probing = 1
-
-vm.swappiness = 10
-EOF
-
-  if [[ "$OS_FAMILY" == "alpine" ]]; then
-    if ! sysctl -p "$SYSCTL_FILE"; then
-      warn "sysctl -p failed. Some VPS kernels/providers may reject specific values. Config was written to ${SYSCTL_FILE}."
-    fi
-    rc-update add sysctl boot >/dev/null 2>&1 || warn "Could not add the sysctl service to the Alpine boot runlevel."
-  elif ! sysctl --system; then
-    warn "sysctl --system failed. Some VPS kernels/providers may reject specific values. Config was written to ${SYSCTL_FILE}."
-  fi
-
-  cat > /root/vps-init-tcp-report.txt <<EOF
-profile=proxy-vps-static
-config_file=${SYSCTL_FILE}
-ip_forward=1
-ipv6_forwarding=1
-tcp_congestion_control=bbr
-default_qdisc=fq
-tcp_buffer_max=67108864
-EOF
-}
-
 prompt_caddy() {
   [[ "$INSTALL_CADDY" != "ask" ]] && return 0
 
@@ -1176,8 +905,6 @@ Important:
 Files changed:
   Platform      : ${OS_FAMILY} (${INIT_SYSTEM})
   SSH hardening : ${SSHD_DROPIN_FILE}
-  TCP tuning    : ${SYSCTL_FILE}
-  TCP report    : /root/vps-init-tcp-report.txt
   UFW           : ${ENABLE_UFW}
   SSHGuard      : ${ENABLE_SSHGUARD}
   Backups       : ${BACKUP_DIR}
@@ -1197,7 +924,6 @@ main() {
   install_public_keys
   enable_time_sync
   configure_swap
-  configure_tcp_tuning
   install_caddy_cloudflare
   harden_ssh
   configure_ufw
